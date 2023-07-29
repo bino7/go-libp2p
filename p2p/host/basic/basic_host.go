@@ -100,7 +100,8 @@ type BasicHost struct {
 	signKey                 crypto.PrivKey
 	caBook                  peerstore.CertifiedAddrBook
 
-	autoNat autonat.AutoNAT
+	autoNat   autonat.AutoNAT
+	netDriver NativeNetDriver
 }
 
 var _ host.Host = (*BasicHost)(nil)
@@ -316,9 +317,168 @@ func NewHost(n network.Network, opts *HostOpts) (*BasicHost, error) {
 	return h, nil
 }
 
+func NewHost2(n network.Network, netDriver NativeNetDriver, opts *HostOpts) (*BasicHost, error) {
+	if opts == nil {
+		opts = &HostOpts{}
+	}
+	if opts.EventBus == nil {
+		opts.EventBus = eventbus.NewBus()
+	}
+
+	psManager, err := pstoremanager.NewPeerstoreManager(n.Peerstore(), opts.EventBus)
+	if err != nil {
+		return nil, err
+	}
+	hostCtx, cancel := context.WithCancel(context.Background())
+
+	h := &BasicHost{
+		network:                 n,
+		psManager:               psManager,
+		mux:                     msmux.NewMultistreamMuxer[protocol.ID](),
+		negtimeout:              DefaultNegotiationTimeout,
+		AddrsFactory:            DefaultAddrsFactory,
+		maResolver:              madns.DefaultResolver,
+		eventbus:                opts.EventBus,
+		addrChangeChan:          make(chan struct{}, 1),
+		ctx:                     hostCtx,
+		ctxCancel:               cancel,
+		disableSignedPeerRecord: opts.DisableSignedPeerRecord,
+		netDriver:               netDriver,
+	}
+
+	h.updateLocalIpAddr()
+
+	if h.emitters.evtLocalProtocolsUpdated, err = h.eventbus.Emitter(&event.EvtLocalProtocolsUpdated{}, eventbus.Stateful); err != nil {
+		return nil, err
+	}
+	if h.emitters.evtLocalAddrsUpdated, err = h.eventbus.Emitter(&event.EvtLocalAddressesUpdated{}, eventbus.Stateful); err != nil {
+		return nil, err
+	}
+
+	if !h.disableSignedPeerRecord {
+		cab, ok := peerstore.GetCertifiedAddrBook(n.Peerstore())
+		if !ok {
+			return nil, errors.New("peerstore should also be a certified address book")
+		}
+		h.caBook = cab
+
+		h.signKey = h.Peerstore().PrivKey(h.ID())
+		if h.signKey == nil {
+			return nil, errors.New("unable to access host key")
+		}
+
+		// persist a signed peer record for self to the peerstore.
+		rec := peer.PeerRecordFromAddrInfo(peer.AddrInfo{
+			ID:    h.ID(),
+			Addrs: h.Addrs(),
+		})
+		ev, err := record.Seal(rec, h.signKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create signed record for self: %w", err)
+		}
+		if _, err := cab.ConsumePeerRecord(ev, peerstore.PermanentAddrTTL); err != nil {
+			return nil, fmt.Errorf("failed to persist signed record to peerstore: %w", err)
+		}
+	}
+
+	if opts.MultistreamMuxer != nil {
+		h.mux = opts.MultistreamMuxer
+	}
+
+	idOpts := []identify.Option{
+		identify.UserAgent(opts.UserAgent),
+		identify.ProtocolVersion(opts.ProtocolVersion),
+	}
+
+	// we can't set this as a default above because it depends on the *BasicHost.
+	if h.disableSignedPeerRecord {
+		idOpts = append(idOpts, identify.DisableSignedPeerRecord())
+	}
+	if opts.EnableMetrics {
+		idOpts = append(idOpts,
+			identify.WithMetricsTracer(
+				identify.NewMetricsTracer(identify.WithRegisterer(opts.PrometheusRegisterer))))
+	}
+
+	h.ids, err = identify.NewIDService(h, idOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Identify service: %s", err)
+	}
+
+	if opts.EnableHolePunching {
+		if opts.EnableMetrics {
+			hpOpts := []holepunch.Option{
+				holepunch.WithMetricsTracer(holepunch.NewMetricsTracer(holepunch.WithRegisterer(opts.PrometheusRegisterer)))}
+			opts.HolePunchingOptions = append(hpOpts, opts.HolePunchingOptions...)
+
+		}
+		h.hps, err = holepunch.NewService(h, h.ids, opts.HolePunchingOptions...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create hole punch service: %w", err)
+		}
+	}
+
+	if uint64(opts.NegotiationTimeout) != 0 {
+		h.negtimeout = opts.NegotiationTimeout
+	}
+
+	if opts.AddrsFactory != nil {
+		h.AddrsFactory = opts.AddrsFactory
+	}
+
+	if opts.NATManager != nil {
+		h.natmgr = opts.NATManager(n)
+	}
+
+	if opts.MultiaddrResolver != nil {
+		h.maResolver = opts.MultiaddrResolver
+	}
+
+	if opts.ConnManager == nil {
+		h.cmgr = &connmgr.NullConnMgr{}
+	} else {
+		h.cmgr = opts.ConnManager
+		n.Notify(h.cmgr.Notifee())
+	}
+
+	if opts.EnableRelayService {
+		if opts.EnableMetrics {
+			// Prefer explicitly provided metrics tracer
+			metricsOpt := []relayv2.Option{
+				relayv2.WithMetricsTracer(
+					relayv2.NewMetricsTracer(relayv2.WithRegisterer(opts.PrometheusRegisterer)))}
+			opts.RelayServiceOpts = append(metricsOpt, opts.RelayServiceOpts...)
+		}
+		h.relayManager = relaysvc.NewRelayManager(h, opts.RelayServiceOpts...)
+	}
+
+	if opts.EnablePing {
+		h.pings = ping.NewPingService(h)
+	}
+
+	n.SetStreamHandler(h.newStreamHandler)
+
+	// register to be notified when the network's listen addrs change,
+	// so we can update our address set and push events if needed
+	listenHandler := func(network.Network, ma.Multiaddr) {
+		h.SignalAddressChange()
+	}
+	n.Notify(&network.NotifyBundle{
+		ListenF:      listenHandler,
+		ListenCloseF: listenHandler,
+	})
+
+	return h, nil
+}
+
 func (h *BasicHost) updateLocalIpAddr() {
 	h.addrMu.Lock()
 	defer h.addrMu.Unlock()
+
+	if h.netDriver != nil {
+		h.updateLocalIpAddrFromNetDriver()
+		return
+	}
 
 	h.filteredInterfaceAddrs = nil
 	h.allInterfaceAddrs = nil
@@ -349,6 +509,56 @@ func (h *BasicHost) updateLocalIpAddr() {
 
 	// Resolve the interface addresses
 	ifaceAddrs, err := manet.InterfaceMultiaddrs()
+	if err != nil {
+		// This usually shouldn't happen, but we could be in some kind
+		// of funky restricted environment.
+		log.Errorw("failed to resolve local interface addresses", "error", err)
+
+		// Add the loopback addresses to the filtered addrs and use them as the non-filtered addrs.
+		// Then bail. There's nothing else we can do here.
+		h.filteredInterfaceAddrs = append(h.filteredInterfaceAddrs, manet.IP4Loopback, manet.IP6Loopback)
+		h.allInterfaceAddrs = h.filteredInterfaceAddrs
+		return
+	}
+
+	for _, addr := range ifaceAddrs {
+		// Skip link-local addrs, they're mostly useless.
+		if !manet.IsIP6LinkLocal(addr) {
+			h.allInterfaceAddrs = append(h.allInterfaceAddrs, addr)
+		}
+	}
+
+	// If netroute failed to get us any interface addresses, use all of
+	// them.
+	if len(h.filteredInterfaceAddrs) == 0 {
+		// Add all addresses.
+		h.filteredInterfaceAddrs = h.allInterfaceAddrs
+	} else {
+		// Only add loopback addresses. Filter these because we might
+		// not _have_ an IPv6 loopback address.
+		for _, addr := range h.allInterfaceAddrs {
+			if manet.IsIPLoopback(addr) {
+				h.filteredInterfaceAddrs = append(h.filteredInterfaceAddrs, addr)
+			}
+		}
+	}
+}
+
+func (h *BasicHost) updateLocalIpAddrFromNetDriver() {
+
+	var err error
+
+	addrs, err := h.netDriver.InterfaceAddrs()
+	if err != nil {
+		log.Errorw("failed to resolve local interface addresses from net driver", "error", err)
+		return
+	}
+
+	ifaceAddrs := make([]ma.Multiaddr, len(addrs))
+	for i, a := range addrs {
+		ifaceAddrs[i], err = manet.FromNetAddr(a)
+	}
+
 	if err != nil {
 		// This usually shouldn't happen, but we could be in some kind
 		// of funky restricted environment.
